@@ -1,9 +1,8 @@
 import streamlit as st
-import pandas as pd
+import polars as pl
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-import time
 import os
 import json
 import plotly.express as px
@@ -38,46 +37,100 @@ def fetch_market_data():
     """Fetch market data from Moneycontrol"""
     url = "https://www.moneycontrol.com/markets/global-indices/"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': 'https://www.moneycontrol.com/'
     }
     
     try:
-        response = requests.get(url, headers=headers)
+        # Make the request with a timeout
+        response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
+        
+        # Print response status for debugging
+        print(f"Response status: {response.status_code}")
+        
+        # Parse the HTML content
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Find all tables with market data
-        tables = soup.find_all('table', {'class': 'mctable1'})
+        # Find all market sections
+        market_sections = soup.find_all('div', {'class': 'market_indices'})
         
-        if not tables:
-            return {"error": "No market data tables found on the page.", "timestamp": datetime.now().isoformat()}
+        if not market_sections:
+            # Try alternative class names if the first one doesn't work
+            market_sections = soup.find_all('div', {'class': 'indices_section'})
+        
+        if not market_sections:
+            # If still no sections found, try to find tables directly
+            market_sections = soup.find_all('div', {'class': 'market_table'})
+        
+        if not market_sections:
+            # As a last resort, try to find any tables with market data
+            tables = soup.find_all('table')
+            if tables:
+                market_sections = [{'tables': tables}]
+        
+        if not market_sections:
+            # Save the HTML for debugging
+            with open('debug_page.html', 'w', encoding='utf-8') as f:
+                f.write(response.text)
+            return {"error": "No market data sections found on the page. Debug HTML saved.", 
+                    "timestamp": datetime.now().isoformat()}
         
         market_data = {}
         
-        # Process each table
-        for table in tables:
-            # Get the table title (market region)
-            title = table.find_previous('h2')
-            if title:
-                title = title.text.strip()
-            else:
-                title = f"Market_Table_{len(market_data) + 1}"
+        # Process each market section
+        for section in market_sections:
+            # Try to get the section title
+            title_elem = section.find_previous(['h2', 'h3', 'h4', 'div'])
+            title = f"Market_Section_{len(market_data) + 1}"
             
-            # Extract table data
-            df = pd.read_html(str(table))[0]
-            market_data[title] = df.to_dict('records')
+            if title_elem:
+                title = title_elem.get_text(strip=True) or title
+            
+            # Find all tables in the section
+            tables = section.find_all('table')
+            
+            if not tables and hasattr(section, 'tables'):
+                tables = section.tables
+            
+            if not tables:
+                continue
+            
+            # Process each table in the section
+            section_data = []
+            
+            for table in tables:
+                try:
+                    # Try to read the table with polars
+                    df = pl.read_html(str(table))[0]
+                    section_data.extend(df.to_dicts())
+                except Exception as e:
+                    print(f"Error processing table: {str(e)}")
+            
+            if section_data:
+                market_data[title] = section_data
+        
+        if not market_data:
+            return {"error": "No valid market data found in any section.", 
+                    "timestamp": datetime.now().isoformat()}
         
         # Add timestamp
         market_data["last_updated"] = datetime.now().isoformat()
         
         # Save to file
-        with open(DATA_FILE, 'w') as f:
-            json.dump(market_data, f)
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(market_data, f, ensure_ascii=False, indent=2)
             
         return market_data
     
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Request failed: {str(e)}", 
+                "timestamp": datetime.now().isoformat()}
     except Exception as e:
-        return {"error": f"An error occurred: {str(e)}", "timestamp": datetime.now().isoformat()}
+        return {"error": f"An error occurred: {str(e)}", 
+                "timestamp": datetime.now().isoformat()}
 
 def load_cached_data():
     """Load cached data if it exists and is not expired"""
@@ -130,29 +183,20 @@ def display_market_data(data):
         st.markdown(f"### {section}")
         
         # Convert to DataFrame for better display
-        df = pd.DataFrame(rows)
-        
-        # Format the change columns if they exist
-        change_columns = [col for col in df.columns if 'change' in col.lower() or 'chg' in col.lower()]
+        df = pl.DataFrame(rows)
         
         # Display the table
         st.dataframe(
             df,
             use_container_width=True,
-            hide_index=True,
-            column_config={
-                col: st.column_config.NumberColumn(
-                    col,
-                    format="%.2f" if df[col].dtype == 'float64' else None
-                ) for col in df.columns
-            }
+            hide_index=True
         )
         
         # Add a line chart for the first numeric column if available
-        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
+        numeric_cols = [col for col in df.columns if df[col].dtype in (pl.Int64, pl.Float64, pl.Int32, pl.Float32)]
         if len(numeric_cols) > 0:
             chart_col = numeric_cols[0]
-            fig = px.line(df, y=chart_col, x=df.index, title=f"{section} - {chart_col}")
+            fig = px.line(df, y=chart_col, x=df.to_pandas().index, title=f"{section} - {chart_col}")
             st.plotly_chart(fig, use_container_width=True)
         
         st.markdown("---")
